@@ -251,18 +251,23 @@ wppClient.on('message', async (msg) => {
   });
 });
 
-// Remover lock files do Chromium deixados por deploys anteriores
-try {
-  const sessionDir = path.join(__dirname, '.wwebjs_auth', 'session-default');
-  if (fs.existsSync(sessionDir)) {
-    const allFiles = fs.readdirSync(sessionDir);
-    for (const f of allFiles) {
-      if (f.startsWith('Singleton') || f === 'lockfile') {
-        try { fs.unlinkSync(path.join(sessionDir, f)); console.log('Lock removido:', f); } catch(e) {}
+// Remover lock files do Chromium (busca recursiva em todo .wwebjs_auth)
+function removeLockFiles(dir) {
+  try {
+    if (!fs.existsSync(dir)) return;
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        removeLockFiles(full);
+      } else if (entry.name.startsWith('Singleton') || entry.name === 'lockfile') {
+        try { fs.unlinkSync(full); console.log('Lock removido:', full); } catch(e) { console.log('Erro ao remover lock:', full, e.message); }
       }
     }
-  }
-} catch(e) { console.log('Aviso ao remover locks:', e.message); }
+  } catch(e) { console.log('Erro ao listar dir:', dir, e.message); }
+}
+removeLockFiles(path.join(__dirname, '.wwebjs_auth'));
+console.log('Limpeza de locks concluida');
 
 wppClient.initialize();
 
