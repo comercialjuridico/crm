@@ -261,19 +261,28 @@ socket.on('message', ({ chatId, message }) => {
 socket.on('chat_updated', () => loadChats());
 
 // ── Init ──
+async function checkStatus() {
+  try {
+    const status = await fetch('/api/status').then(r => r.json());
+    state.hasOpenAI = status.hasOpenAI;
+    if (status.ready && !state.ready) {
+      state.ready = true; setStatus(true);
+      document.getElementById('qr-screen').style.display = 'none';
+      showNoChatSelected();
+      await loadChats(); await loadLabels();
+    }
+  } catch(e) {}
+}
+
 window.addEventListener('load', async () => {
   const me = await fetch('/api/me').then(r => r.ok ? r.json() : null);
   if (!me) { window.location.href = '/login.html'; return; }
   document.getElementById('user-info').textContent = me.name;
 
-  const status = await fetch('/api/status').then(r => r.json());
-  state.hasOpenAI = status.hasOpenAI;
-  if (status.ready) {
-    state.ready = true; setStatus(true);
-    document.getElementById('qr-screen').style.display = 'none';
-    showNoChatSelected();
-    await loadChats(); await loadLabels();
-  }
+  await checkStatus();
+
+  // Polling de segurança: verifica o status a cada 3s caso o evento socket seja perdido
+  setInterval(checkStatus, 3000);
 });
 
 // ── API ──
