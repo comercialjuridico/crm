@@ -16,6 +16,19 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 const PORT = process.env.PORT || 3000;
+
+// Estado global do WhatsApp (declarado aqui para o handler de connection ter acesso)
+let clientReady = false;
+let lastQR = null;
+
+// Quando um novo cliente conecta via socket, envia o estado atual imediatamente
+io.on('connection', (socket) => {
+  if (clientReady) {
+    socket.emit('ready');
+  } else if (lastQR) {
+    socket.emit('qr', lastQR);
+  }
+});
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 app.use(express.json({ limit: '50mb' }));
@@ -162,15 +175,17 @@ const wppClient = new Client({
   },
 });
 
-let clientReady = false;
-
 wppClient.on('qr', async (qr) => {
   console.log('QR gerado — escaneie no app');
-  try { io.emit('qr', await qrcode.toDataURL(qr)); } catch (e) { console.error('Erro QR:', e); }
+  try {
+    lastQR = await qrcode.toDataURL(qr);
+    io.emit('qr', lastQR);
+  } catch (e) { console.error('Erro QR:', e); }
 });
 wppClient.on('ready', () => {
   console.log('WhatsApp conectado!');
   clientReady = true;
+  lastQR = null;
   io.emit('ready');
   syncChats();
 });
