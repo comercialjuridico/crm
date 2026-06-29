@@ -86,6 +86,7 @@ async function initDB() {
       await pool.query('INSERT INTO labels (name,color) VALUES ($1,$2) ON CONFLICT (name) DO NOTHING', [name, color]);
     }
 
+    isPostgres = true;
     db = {
       async run(sql, params=[]) { await pool.query(pgSql(sql), params); },
       async get(sql, params=[]) { const r = await pool.query(pgSql(sql), params); return r.rows[0]; },
@@ -128,7 +129,21 @@ async function initDB() {
   console.log('Banco de dados pronto.');
 }
 
-function pgSql(sql) { let i = 0; return sql.replace(/\?/g, () => `$${++i}`); }
+let isPostgres = false;
+function pgSql(sql) {
+  let i = 0;
+  let s = sql.replace(/\?/g, () => `$${++i}`);
+  s = s.replace(/INSERT OR IGNORE INTO/gi, 'INSERT INTO');
+  s = s.replace(/ON CONFLICT DO NOTHING/gi, 'ON CONFLICT DO NOTHING'); // already ok
+  // Add ON CONFLICT DO NOTHING to bare INSERT INTO ... VALUES (...) without ON CONFLICT
+  if (/INSERT INTO/i.test(s) && !/ON CONFLICT/i.test(s)) {
+    s = s.trimEnd();
+    if (s.endsWith(')')) s += ' ON CONFLICT DO NOTHING';
+  }
+  return s;
+}
+function nowSql() { return isPostgres ? 'EXTRACT(EPOCH FROM NOW())::BIGINT' : "strftime('%s','now')"; }
+function boolVal(v) { return isPostgres ? (v ? 'true' : 'false') : (v ? 1 : 0); }
 
 // ─── Usuários ─────────────────────────────────────────────────────────────────
 const SALT = 'crm-salt-2026';
@@ -274,13 +289,14 @@ wppClient.initialize();
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 async function upsertChat(chat, lastMsg = null) {
   const body = lastMsg?.body || (lastMsg?.hasMedia ? '[mídia]' : null);
+  const now = nowSql();
   await db.run(
     `INSERT INTO chats (id,name,is_group,last_message,last_message_time,updated_at)
-     VALUES (?,?,?,?,?,strftime('%s','now'))
+     VALUES (?,?,?,?,?,${now})
      ON CONFLICT(id) DO UPDATE SET name=excluded.name, is_group=excluded.is_group,
        last_message=COALESCE(excluded.last_message,last_message),
        last_message_time=COALESCE(excluded.last_message_time,last_message_time),
-       updated_at=strftime('%s','now')`,
+       updated_at=${now}`,
     [chat.id._serialized, chat.name, chat.isGroup ? 1 : 0, body, lastMsg?.timestamp || null]
   );
 }
@@ -300,15 +316,20 @@ app.get('/api/status', (req, res) => res.json({ ready: clientReady, hasOpenAI: !
 app.get('/api/chats', async (req, res) => {
   try {
     const { search, label, unhandled, type, archived } = req.query;
-    let sql = `SELECT c.*, GROUP_CONCAT(l.id||':'||l.name||':'||l.color,'|') AS labels_raw
+    const aggFn = isPostgres
+      ? `string_agg(l.id::text||':'||l.name||':'||l.color,'|')`
+      : `GROUP_CONCAT(l.id||':'||l.name||':'||l.color,'|')`;
+    let sql = `SELECT c.*, ${aggFn} AS labels_raw
       FROM chats c LEFT JOIN chat_labels cl ON cl.chat_id=c.id LEFT JOIN labels l ON l.id=cl.label_id WHERE 1=1`;
     const p = [];
-    if (archived === '1') sql += ' AND c.archived=1';
-    else sql += ' AND (c.archived=0 OR c.archived IS NULL)';
-    if (search) { sql += ' AND c.name LIKE ?'; p.push(`%${search}%`); }
-    if (unhandled === '1') sql += ' AND c.unhandled=1';
-    if (type === 'group') sql += ' AND c.is_group=1';
-    else if (type === 'direct') sql += ' AND c.is_group=0';
+    const T = isPostgres ? 'true' : '1';
+    const F = isPostgres ? 'false' : '0';
+    if (archived === '1') sql += ` AND c.archived=${T}`;
+    else sql += ` AND (c.archived=${F} OR c.archived IS NULL)`;
+    if (search) { sql += ' AND c.name ILIKE ?'; p.push(`%${search}%`); }
+    if (unhandled === '1') sql += ` AND c.unhandled=${T}`;
+    if (type === 'group') sql += ` AND c.is_group=${T}`;
+    else if (type === 'direct') sql += ` AND c.is_group=${F}`;
     if (label) { sql += ' AND cl.label_id=?'; p.push(label); }
     sql += ' GROUP BY c.id ORDER BY c.updated_at DESC';
     const rows = await db.all(sql, p);
@@ -316,7 +337,7 @@ app.get('/api/chats', async (req, res) => {
       ...r, is_group: !!r.is_group, unhandled: !!r.unhandled, archived: !!r.archived,
       labels: r.labels_raw ? r.labels_raw.split('|').map(s => { const [id,name,color]=s.split(':'); return {id:Number(id),name,color}; }) : [],
     })));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { console.error('Erro /api/chats:', e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/chats/:chatId/messages', async (req, res) => {
@@ -403,14 +424,14 @@ app.post('/api/messages/:msgId/transcribe', async (req, res) => {
 
 // Toggle não tratado
 app.post('/api/chats/:chatId/unhandled', async (req, res) => {
-  await db.run('UPDATE chats SET unhandled=? WHERE id=?', [req.body.unhandled ? 1 : 0, req.params.chatId]);
+  await db.run('UPDATE chats SET unhandled=? WHERE id=?', [boolVal(req.body.unhandled), req.params.chatId]);
   io.emit('chat_updated', { chatId: req.params.chatId });
   res.json({ ok: true });
 });
 
 // Toggle arquivar
 app.post('/api/chats/:chatId/archive', async (req, res) => {
-  await db.run('UPDATE chats SET archived=? WHERE id=?', [req.body.archived ? 1 : 0, req.params.chatId]);
+  await db.run('UPDATE chats SET archived=? WHERE id=?', [boolVal(req.body.archived), req.params.chatId]);
   io.emit('chat_updated', { chatId: req.params.chatId });
   res.json({ ok: true });
 });
