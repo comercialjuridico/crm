@@ -1,19 +1,24 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const { Pool } = require('pg');
 const qrcode = require('qrcode');
 const session = require('express-session');
 const crypto = require('crypto');
 const path = require('path');
+const multer = require('multer');
+const fs = require('fs');
+const OpenAI = require('openai');
 
 // ─── App Setup ───────────────────────────────────────────────────────────────
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 const PORT = process.env.PORT || 3000;
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(session({
   secret: process.env.SESSION_SECRET || 'crm-whatsapp-secret-2026',
@@ -22,20 +27,22 @@ app.use(session({
   cookie: { maxAge: 8 * 60 * 60 * 1000 },
 }));
 
-// ─── Banco de dados (SQLite local OU PostgreSQL/Supabase) ─────────────────────
-let db; // adapter unificado
+// OpenAI
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+
+// ─── Banco de dados ───────────────────────────────────────────────────────────
+let db;
 
 async function initDB() {
   if (process.env.DATABASE_URL) {
-    // ── PostgreSQL (Railway + Supabase) ──
-    console.log('Usando PostgreSQL (Supabase)...');
-    const { Pool } = require('pg');
+    console.log('Usando PostgreSQL...');
     const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS chats (
         id TEXT PRIMARY KEY, name TEXT, is_group BOOLEAN DEFAULT false,
         last_message TEXT, last_message_time BIGINT, unhandled BOOLEAN DEFAULT false,
+        archived BOOLEAN DEFAULT false,
         updated_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
       );
       CREATE TABLE IF NOT EXISTS labels (
@@ -48,13 +55,20 @@ async function initDB() {
       );
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-        from_me BOOLEAN DEFAULT false, author TEXT, body TEXT, timestamp BIGINT
+        from_me BOOLEAN DEFAULT false, author TEXT, body TEXT, timestamp BIGINT,
+        media_type TEXT, media_filename TEXT, media_data TEXT,
+        transcription TEXT, summary TEXT
       );
     `);
+    // Add missing columns if upgrading
+    await pool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false`).catch(() => {});
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_filename TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_data TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS transcription TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS summary TEXT`).catch(() => {});
 
-    const seedLabels = [
-      ['Urgente','#ef4444'],['Aguardando','#f59e0b'],['Em andamento','#3b82f6'],['Concluído','#10b981']
-    ];
+    const seedLabels = [['Urgente','#ef4444'],['Aguardando','#f59e0b'],['Em andamento','#3b82f6'],['Concluído','#10b981']];
     for (const [name, color] of seedLabels) {
       await pool.query('INSERT INTO labels (name,color) VALUES ($1,$2) ON CONFLICT (name) DO NOTHING', [name, color]);
     }
@@ -64,9 +78,7 @@ async function initDB() {
       async get(sql, params=[]) { const r = await pool.query(pgSql(sql), params); return r.rows[0]; },
       async all(sql, params=[]) { const r = await pool.query(pgSql(sql), params); return r.rows; },
     };
-
   } else {
-    // ── SQLite local ──
     console.log('Usando SQLite local...');
     const { DatabaseSync } = require('node:sqlite');
     const sqlite = new DatabaseSync('crm.db');
@@ -74,6 +86,7 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS chats (
         id TEXT PRIMARY KEY, name TEXT, is_group INTEGER DEFAULT 0,
         last_message TEXT, last_message_time INTEGER, unhandled INTEGER DEFAULT 0,
+        archived INTEGER DEFAULT 0,
         updated_at INTEGER DEFAULT (strftime('%s','now'))
       );
       CREATE TABLE IF NOT EXISTS labels (
@@ -84,12 +97,12 @@ async function initDB() {
       );
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, from_me INTEGER DEFAULT 0,
-        author TEXT, body TEXT, timestamp INTEGER
+        author TEXT, body TEXT, timestamp INTEGER,
+        media_type TEXT, media_filename TEXT, media_data TEXT,
+        transcription TEXT, summary TEXT
       );
     `);
-    const seedLabels = [
-      ['Urgente','#ef4444'],['Aguardando','#f59e0b'],['Em andamento','#3b82f6'],['Concluído','#10b981']
-    ];
+    const seedLabels = [['Urgente','#ef4444'],['Aguardando','#f59e0b'],['Em andamento','#3b82f6'],['Concluído','#10b981']];
     for (const [name, color] of seedLabels) {
       sqlite.prepare('INSERT OR IGNORE INTO labels (name,color) VALUES (?,?)').run(name, color);
     }
@@ -102,16 +115,11 @@ async function initDB() {
   console.log('Banco de dados pronto.');
 }
 
-// Converte ? para $1,$2 (PostgreSQL)
-function pgSql(sql) {
-  let i = 0;
-  return sql.replace(/\?/g, () => `$${++i}`);
-}
+function pgSql(sql) { let i = 0; return sql.replace(/\?/g, () => `$${++i}`); }
 
 // ─── Usuários ─────────────────────────────────────────────────────────────────
 const SALT = 'crm-salt-2026';
 function hashPwd(pwd) { return crypto.createHmac('sha256', SALT).update(pwd).digest('hex'); }
-
 const USERS = [
   { email: 'comercialjuridico1@gmail.com',         hash: hashPwd('comercial2026@'), name: 'Comercial Jurídico' },
   { email: 'comercialjuridicofinanceiro@gmail.com', hash: hashPwd('comercial2026@'), name: 'Financeiro' },
@@ -128,7 +136,6 @@ app.get('/login.html', (req, res) => {
   if (req.session?.user) return res.redirect('/');
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
-
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
   const user = USERS.find(u => u.email === email && u.hash === hashPwd(password));
@@ -136,13 +143,11 @@ app.post('/api/login', (req, res) => {
   req.session.user = { email: user.email, name: user.name };
   res.json({ ok: true, name: user.name });
 });
-
 app.post('/api/logout', (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
 app.get('/api/me', (req, res) => {
   if (!req.session?.user) return res.status(401).json({ error: 'Não autenticado' });
   res.json(req.session.user);
 });
-
 app.get('/', requireAuth, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.use(requireAuth);
 app.use(express.static(path.join(__dirname, 'public')));
@@ -163,27 +168,71 @@ wppClient.on('qr', async (qr) => {
   console.log('QR gerado — escaneie no app');
   try { io.emit('qr', await qrcode.toDataURL(qr)); } catch (e) { console.error('Erro QR:', e); }
 });
-
 wppClient.on('ready', () => {
   console.log('WhatsApp conectado!');
   clientReady = true;
   io.emit('ready');
   syncChats();
 });
-
 wppClient.on('auth_failure', () => io.emit('auth_failure'));
 wppClient.on('disconnected', () => { clientReady = false; io.emit('disconnected'); });
 
 wppClient.on('message', async (msg) => {
   const chat = await msg.getChat();
   await upsertChat(chat, msg);
+
+  let mediaType = null, mediaFilename = null, mediaData = null, transcription = null, summary = null;
+
+  if (msg.hasMedia) {
+    try {
+      const media = await msg.downloadMedia();
+      mediaType = media.mimetype;
+      mediaFilename = media.filename || null;
+
+      if (media.mimetype.startsWith('audio/') || media.mimetype === 'application/ogg') {
+        // Transcrever áudio com OpenAI Whisper
+        if (openai) {
+          try {
+            const audioBuffer = Buffer.from(media.data, 'base64');
+            const ext = media.mimetype.includes('ogg') ? 'ogg' : 'mp3';
+            const { toFile } = require('openai');
+            const file = await toFile(audioBuffer, `audio.${ext}`, { type: media.mimetype });
+            const result = await openai.audio.transcriptions.create({ file, model: 'whisper-1', language: 'pt' });
+            transcription = result.text;
+
+            // Resumo com GPT
+            if (transcription && transcription.length > 50) {
+              const sumResult = await openai.chat.completions.create({
+                model: 'gpt-4o-mini',
+                messages: [
+                  { role: 'system', content: 'Você é um assistente de CRM. Faça um resumo conciso (máximo 2 linhas) do áudio transcrito.' },
+                  { role: 'user', content: transcription },
+                ],
+                max_tokens: 100,
+              });
+              summary = sumResult.choices[0].message.content;
+            }
+          } catch (e) { console.error('Erro transcrição:', e.message); }
+        }
+      } else {
+        // Para arquivos não-áudio, armazenar base64 (imagens, docs pequenos)
+        if (media.data && media.data.length < 2 * 1024 * 1024) { // max 2MB base64
+          mediaData = media.data;
+        }
+      }
+    } catch (e) { console.error('Erro download mídia:', e.message); }
+  }
+
+  const msgBody = msg.body || (mediaType ? `[${mediaType.split('/')[0]}]` : '');
+
   await db.run(
-    'INSERT OR IGNORE INTO messages (id,chat_id,from_me,author,body,timestamp) VALUES (?,?,?,?,?,?)',
-    [msg.id._serialized, chat.id._serialized, msg.fromMe ? 1 : 0, msg.author || msg.from, msg.body, msg.timestamp]
+    'INSERT OR IGNORE INTO messages (id,chat_id,from_me,author,body,timestamp,media_type,media_filename,media_data,transcription,summary) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+    [msg.id._serialized, chat.id._serialized, msg.fromMe ? 1 : 0, msg.author || msg.from, msgBody, msg.timestamp, mediaType, mediaFilename, mediaData, transcription, summary]
   );
+
   io.emit('message', {
     chatId: chat.id._serialized,
-    message: { id: msg.id._serialized, fromMe: msg.fromMe, author: msg.author || msg.from, body: msg.body, timestamp: msg.timestamp },
+    message: { id: msg.id._serialized, fromMe: msg.fromMe, author: msg.author || msg.from, body: msgBody, timestamp: msg.timestamp, mediaType, mediaFilename, transcription, summary },
   });
 });
 
@@ -191,6 +240,7 @@ wppClient.initialize();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 async function upsertChat(chat, lastMsg = null) {
+  const body = lastMsg?.body || (lastMsg?.hasMedia ? '[mídia]' : null);
   await db.run(
     `INSERT INTO chats (id,name,is_group,last_message,last_message_time,updated_at)
      VALUES (?,?,?,?,?,strftime('%s','now'))
@@ -198,7 +248,7 @@ async function upsertChat(chat, lastMsg = null) {
        last_message=COALESCE(excluded.last_message,last_message),
        last_message_time=COALESCE(excluded.last_message_time,last_message_time),
        updated_at=strftime('%s','now')`,
-    [chat.id._serialized, chat.name, chat.isGroup ? 1 : 0, lastMsg?.body || null, lastMsg?.timestamp || null]
+    [chat.id._serialized, chat.name, chat.isGroup ? 1 : 0, body, lastMsg?.timestamp || null]
   );
 }
 
@@ -212,14 +262,16 @@ async function syncChats() {
 }
 
 // ─── REST API ─────────────────────────────────────────────────────────────────
-app.get('/api/status', (req, res) => res.json({ ready: clientReady }));
+app.get('/api/status', (req, res) => res.json({ ready: clientReady, hasOpenAI: !!openai }));
 
 app.get('/api/chats', async (req, res) => {
   try {
-    const { search, label, unhandled, type } = req.query;
+    const { search, label, unhandled, type, archived } = req.query;
     let sql = `SELECT c.*, GROUP_CONCAT(l.id||':'||l.name||':'||l.color,'|') AS labels_raw
       FROM chats c LEFT JOIN chat_labels cl ON cl.chat_id=c.id LEFT JOIN labels l ON l.id=cl.label_id WHERE 1=1`;
     const p = [];
+    if (archived === '1') sql += ' AND c.archived=1';
+    else sql += ' AND (c.archived=0 OR c.archived IS NULL)';
     if (search) { sql += ' AND c.name LIKE ?'; p.push(`%${search}%`); }
     if (unhandled === '1') sql += ' AND c.unhandled=1';
     if (type === 'group') sql += ' AND c.is_group=1';
@@ -228,7 +280,7 @@ app.get('/api/chats', async (req, res) => {
     sql += ' GROUP BY c.id ORDER BY c.updated_at DESC';
     const rows = await db.all(sql, p);
     res.json(rows.map(r => ({
-      ...r, is_group: !!r.is_group, unhandled: !!r.unhandled,
+      ...r, is_group: !!r.is_group, unhandled: !!r.unhandled, archived: !!r.archived,
       labels: r.labels_raw ? r.labels_raw.split('|').map(s => { const [id,name,color]=s.split(':'); return {id:Number(id),name,color}; }) : [],
     })));
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -251,14 +303,87 @@ app.get('/api/chats/:chatId/messages', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Enviar mensagem de texto
+app.post('/api/chats/:chatId/send', async (req, res) => {
+  if (!clientReady) return res.status(503).json({ error: 'WhatsApp não conectado' });
+  const { chatId } = req.params;
+  const { message } = req.body;
+  if (!message?.trim()) return res.status(400).json({ error: 'Mensagem vazia' });
+  try {
+    const sentMsg = await wppClient.sendMessage(chatId, message);
+    const ts = Math.floor(Date.now() / 1000);
+    await db.run('INSERT OR IGNORE INTO messages (id,chat_id,from_me,body,timestamp) VALUES (?,?,1,?,?)',
+      [sentMsg.id._serialized, chatId, message, ts]);
+    await db.run('UPDATE chats SET last_message=?, last_message_time=?, updated_at=? WHERE id=?', [message, ts, ts, chatId]);
+    res.json({ ok: true, id: sentMsg.id._serialized });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Enviar arquivo/áudio
+app.post('/api/chats/:chatId/send-media', upload.single('file'), async (req, res) => {
+  if (!clientReady) return res.status(503).json({ error: 'WhatsApp não conectado' });
+  const { chatId } = req.params;
+  if (!req.file) return res.status(400).json({ error: 'Nenhum arquivo enviado' });
+  try {
+    const base64 = req.file.buffer.toString('base64');
+    const media = new MessageMedia(req.file.mimetype, base64, req.file.originalname);
+    const caption = req.body.caption || '';
+    const sentMsg = await wppClient.sendMessage(chatId, media, { caption });
+    const ts = Math.floor(Date.now() / 1000);
+    const body = caption || `[${req.file.mimetype.split('/')[0]}]`;
+    await db.run('INSERT OR IGNORE INTO messages (id,chat_id,from_me,body,timestamp,media_type,media_filename) VALUES (?,?,1,?,?,?,?)',
+      [sentMsg.id._serialized, chatId, body, ts, req.file.mimetype, req.file.originalname]);
+    await db.run('UPDATE chats SET last_message=?, last_message_time=?, updated_at=? WHERE id=?', [body, ts, ts, chatId]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Transcrever áudio recebido manualmente
+app.post('/api/messages/:msgId/transcribe', async (req, res) => {
+  if (!openai) return res.status(503).json({ error: 'OpenAI não configurado' });
+  const { msgId } = req.params;
+  try {
+    const msg = await db.get('SELECT * FROM messages WHERE id=?', [msgId]);
+    if (!msg?.media_data) return res.status(404).json({ error: 'Mídia não encontrada' });
+    const audioBuffer = Buffer.from(msg.media_data, 'base64');
+    const ext = msg.media_type?.includes('ogg') ? 'ogg' : 'mp3';
+    const { toFile } = require('openai');
+    const file = await toFile(audioBuffer, `audio.${ext}`, { type: msg.media_type });
+    const result = await openai.audio.transcriptions.create({ file, model: 'whisper-1', language: 'pt' });
+    const transcription = result.text;
+    let summary = null;
+    if (transcription.length > 50) {
+      const sumResult = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Faça um resumo conciso (máximo 2 linhas) do áudio transcrito.' },
+          { role: 'user', content: transcription },
+        ],
+        max_tokens: 100,
+      });
+      summary = sumResult.choices[0].message.content;
+    }
+    await db.run('UPDATE messages SET transcription=?, summary=? WHERE id=?', [transcription, summary, msgId]);
+    res.json({ transcription, summary });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Toggle não tratado
 app.post('/api/chats/:chatId/unhandled', async (req, res) => {
   await db.run('UPDATE chats SET unhandled=? WHERE id=?', [req.body.unhandled ? 1 : 0, req.params.chatId]);
   io.emit('chat_updated', { chatId: req.params.chatId });
   res.json({ ok: true });
 });
 
-app.get('/api/labels', async (req, res) => res.json(await db.all('SELECT * FROM labels ORDER BY name')));
+// Toggle arquivar
+app.post('/api/chats/:chatId/archive', async (req, res) => {
+  await db.run('UPDATE chats SET archived=? WHERE id=?', [req.body.archived ? 1 : 0, req.params.chatId]);
+  io.emit('chat_updated', { chatId: req.params.chatId });
+  res.json({ ok: true });
+});
 
+// Labels
+app.get('/api/labels', async (req, res) => res.json(await db.all('SELECT * FROM labels ORDER BY name')));
 app.post('/api/labels', async (req, res) => {
   const { name, color } = req.body;
   if (!name) return res.status(400).json({ error: 'Nome obrigatório' });
@@ -268,24 +393,20 @@ app.post('/api/labels', async (req, res) => {
     res.json(label);
   } catch { res.status(409).json({ error: 'Etiqueta já existe' }); }
 });
-
 app.delete('/api/labels/:id', async (req, res) => {
   await db.run('DELETE FROM labels WHERE id=?', [req.params.id]);
   res.json({ ok: true });
 });
-
 app.post('/api/chats/:chatId/labels/:labelId', async (req, res) => {
   await db.run('INSERT OR IGNORE INTO chat_labels (chat_id,label_id) VALUES (?,?)', [req.params.chatId, req.params.labelId]);
   io.emit('chat_updated', { chatId: req.params.chatId });
   res.json({ ok: true });
 });
-
 app.delete('/api/chats/:chatId/labels/:labelId', async (req, res) => {
   await db.run('DELETE FROM chat_labels WHERE chat_id=? AND label_id=?', [req.params.chatId, req.params.labelId]);
   io.emit('chat_updated', { chatId: req.params.chatId });
   res.json({ ok: true });
 });
-
 app.post('/api/sync', async (req, res) => {
   if (!clientReady) return res.status(503).json({ error: 'WhatsApp não conectado' });
   syncChats();
