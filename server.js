@@ -1,7 +1,7 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const { Client, LocalAuth, RemoteAuth, MessageMedia } = require('whatsapp-web.js');
 const { Pool } = require('pg');
 const qrcode = require('qrcode');
 const session = require('express-session');
@@ -16,19 +16,6 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 const PORT = process.env.PORT || 3000;
-
-// Estado global do WhatsApp (declarado aqui para o handler de connection ter acesso)
-let clientReady = false;
-let lastQR = null;
-
-// Quando um novo cliente conecta via socket, envia o estado atual imediatamente
-io.on('connection', (socket) => {
-  if (clientReady) {
-    socket.emit('ready');
-  } else if (lastQR) {
-    socket.emit('qr', lastQR);
-  }
-});
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 app.use(express.json({ limit: '50mb' }));
@@ -40,18 +27,76 @@ app.use(session({
   cookie: { maxAge: 8 * 60 * 60 * 1000 },
 }));
 
-// OpenAI
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 
-// ─── Banco de dados ───────────────────────────────────────────────────────────
-let db;
+// ─── Estado global ────────────────────────────────────────────────────────────
+let clientReady = false;
+let lastQR = null;
+let wppClient = null;
+let db = null;
+let isPostgres = false;
+let pgPool = null;
 
+io.on('connection', (socket) => {
+  if (clientReady) socket.emit('ready');
+  else if (lastQR) socket.emit('qr', lastQR);
+});
+
+// ─── DB helpers ───────────────────────────────────────────────────────────────
+function pgSql(sql) {
+  let i = 0;
+  let s = sql.replace(/\?/g, () => `$${++i}`);
+  s = s.replace(/INSERT OR IGNORE INTO/gi, 'INSERT INTO');
+  if (/INSERT INTO/i.test(s) && !/ON CONFLICT/i.test(s)) {
+    s = s.trimEnd();
+    if (s.endsWith(')')) s += ' ON CONFLICT DO NOTHING';
+  }
+  return s;
+}
+function nowSql() { return isPostgres ? 'EXTRACT(EPOCH FROM NOW())::BIGINT' : "strftime('%s','now')"; }
+function boolVal(v) { return isPostgres ? (v ? true : false) : (v ? 1 : 0); }
+
+// ─── PostgreSQL store para RemoteAuth ─────────────────────────────────────────
+class PostgresStore {
+  async sessionExists({ session }) {
+    const r = await pgPool.query('SELECT 1 FROM wwebjs_sessions WHERE name=$1', [session]);
+    return r.rowCount > 0;
+  }
+  async save({ session }) {
+    try {
+      const zipPath = `RemoteAuth-${session}.zip`;
+      if (!fs.existsSync(zipPath)) { console.log('Zip não encontrado:', zipPath); return; }
+      const data = fs.readFileSync(zipPath).toString('base64');
+      await pgPool.query(
+        'INSERT INTO wwebjs_sessions (name,data) VALUES ($1,$2) ON CONFLICT (name) DO UPDATE SET data=$2, updated_at=NOW()',
+        [session, data]
+      );
+      console.log('Sessão WhatsApp salva no PostgreSQL');
+    } catch(e) { console.error('Erro ao salvar sessão:', e.message); }
+  }
+  async extract({ session, path: destPath }) {
+    try {
+      const r = await pgPool.query('SELECT data FROM wwebjs_sessions WHERE name=$1', [session]);
+      if (!r.rows[0]) { console.log('Nenhuma sessão salva — aguardando QR'); return; }
+      fs.writeFileSync(`${destPath}.zip`, Buffer.from(r.rows[0].data, 'base64'));
+      console.log('Sessão WhatsApp restaurada do PostgreSQL');
+    } catch(e) { console.error('Erro ao extrair sessão:', e.message); }
+  }
+  async delete({ session }) {
+    await pgPool.query('DELETE FROM wwebjs_sessions WHERE name=$1', [session]);
+  }
+}
+
+// ─── Banco de dados ───────────────────────────────────────────────────────────
 async function initDB() {
   if (process.env.DATABASE_URL) {
     console.log('Usando PostgreSQL...');
-    const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    pgPool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-    await pool.query(`
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS wwebjs_sessions (
+        name TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
       CREATE TABLE IF NOT EXISTS chats (
         id TEXT PRIMARY KEY, name TEXT, is_group BOOLEAN DEFAULT false,
         last_message TEXT, last_message_time BIGINT, unhandled BOOLEAN DEFAULT false,
@@ -73,24 +118,23 @@ async function initDB() {
         transcription TEXT, summary TEXT
       );
     `);
-    // Add missing columns if upgrading
-    await pool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false`).catch(() => {});
-    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT`).catch(() => {});
-    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_filename TEXT`).catch(() => {});
-    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_data TEXT`).catch(() => {});
-    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS transcription TEXT`).catch(() => {});
-    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS summary TEXT`).catch(() => {});
+    await pgPool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false`).catch(() => {});
+    await pgPool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT`).catch(() => {});
+    await pgPool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_filename TEXT`).catch(() => {});
+    await pgPool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_data TEXT`).catch(() => {});
+    await pgPool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS transcription TEXT`).catch(() => {});
+    await pgPool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS summary TEXT`).catch(() => {});
 
     const seedLabels = [['Urgente','#ef4444'],['Aguardando','#f59e0b'],['Em andamento','#3b82f6'],['Concluído','#10b981']];
     for (const [name, color] of seedLabels) {
-      await pool.query('INSERT INTO labels (name,color) VALUES ($1,$2) ON CONFLICT (name) DO NOTHING', [name, color]);
+      await pgPool.query('INSERT INTO labels (name,color) VALUES ($1,$2) ON CONFLICT (name) DO NOTHING', [name, color]);
     }
 
     isPostgres = true;
     db = {
-      async run(sql, params=[]) { await pool.query(pgSql(sql), params); },
-      async get(sql, params=[]) { const r = await pool.query(pgSql(sql), params); return r.rows[0]; },
-      async all(sql, params=[]) { const r = await pool.query(pgSql(sql), params); return r.rows; },
+      async run(sql, params=[]) { await pgPool.query(pgSql(sql), params); },
+      async get(sql, params=[]) { const r = await pgPool.query(pgSql(sql), params); return r.rows[0]; },
+      async all(sql, params=[]) { const r = await pgPool.query(pgSql(sql), params); return r.rows; },
     };
   } else {
     console.log('Usando SQLite local...');
@@ -129,22 +173,6 @@ async function initDB() {
   console.log('Banco de dados pronto.');
 }
 
-let isPostgres = false;
-function pgSql(sql) {
-  let i = 0;
-  let s = sql.replace(/\?/g, () => `$${++i}`);
-  s = s.replace(/INSERT OR IGNORE INTO/gi, 'INSERT INTO');
-  s = s.replace(/ON CONFLICT DO NOTHING/gi, 'ON CONFLICT DO NOTHING'); // already ok
-  // Add ON CONFLICT DO NOTHING to bare INSERT INTO ... VALUES (...) without ON CONFLICT
-  if (/INSERT INTO/i.test(s) && !/ON CONFLICT/i.test(s)) {
-    s = s.trimEnd();
-    if (s.endsWith(')')) s += ' ON CONFLICT DO NOTHING';
-  }
-  return s;
-}
-function nowSql() { return isPostgres ? 'EXTRACT(EPOCH FROM NOW())::BIGINT' : "strftime('%s','now')"; }
-function boolVal(v) { return isPostgres ? (v ? 'true' : 'false') : (v ? 1 : 0); }
-
 // ─── Usuários ─────────────────────────────────────────────────────────────────
 const SALT = 'crm-salt-2026';
 function hashPwd(pwd) { return crypto.createHmac('sha256', SALT).update(pwd).digest('hex'); }
@@ -180,112 +208,6 @@ app.get('/', requireAuth, (req, res) => res.sendFile(path.join(__dirname, 'publi
 app.use(requireAuth);
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ─── WhatsApp Client ──────────────────────────────────────────────────────────
-const wppClient = new Client({
-  authStrategy: new LocalAuth({ dataPath: process.env.WWEBJS_PATH || './.wwebjs_auth' }),
-  puppeteer: {
-    headless: true,
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--single-process'],
-  },
-});
-
-wppClient.on('qr', async (qr) => {
-  console.log('QR gerado — escaneie no app');
-  try {
-    lastQR = await qrcode.toDataURL(qr);
-    io.emit('qr', lastQR);
-  } catch (e) { console.error('Erro QR:', e); }
-});
-wppClient.on('ready', () => {
-  console.log('WhatsApp conectado!');
-  clientReady = true;
-  lastQR = null;
-  io.emit('ready');
-  syncChats();
-});
-wppClient.on('auth_failure', () => io.emit('auth_failure'));
-wppClient.on('disconnected', () => { clientReady = false; io.emit('disconnected'); });
-
-wppClient.on('message', async (msg) => {
-  const chat = await msg.getChat();
-  await upsertChat(chat, msg);
-
-  let mediaType = null, mediaFilename = null, mediaData = null, transcription = null, summary = null;
-
-  if (msg.hasMedia) {
-    try {
-      const media = await msg.downloadMedia();
-      mediaType = media.mimetype;
-      mediaFilename = media.filename || null;
-
-      if (media.mimetype.startsWith('audio/') || media.mimetype === 'application/ogg') {
-        // Transcrever áudio com OpenAI Whisper
-        if (openai) {
-          try {
-            const audioBuffer = Buffer.from(media.data, 'base64');
-            const ext = media.mimetype.includes('ogg') ? 'ogg' : 'mp3';
-            const { toFile } = require('openai');
-            const file = await toFile(audioBuffer, `audio.${ext}`, { type: media.mimetype });
-            const result = await openai.audio.transcriptions.create({ file, model: 'whisper-1', language: 'pt' });
-            transcription = result.text;
-
-            // Resumo com GPT
-            if (transcription && transcription.length > 50) {
-              const sumResult = await openai.chat.completions.create({
-                model: 'gpt-4o-mini',
-                messages: [
-                  { role: 'system', content: 'Você é um assistente de CRM. Faça um resumo conciso (máximo 2 linhas) do áudio transcrito.' },
-                  { role: 'user', content: transcription },
-                ],
-                max_tokens: 100,
-              });
-              summary = sumResult.choices[0].message.content;
-            }
-          } catch (e) { console.error('Erro transcrição:', e.message); }
-        }
-      } else {
-        // Para arquivos não-áudio, armazenar base64 (imagens, docs pequenos)
-        if (media.data && media.data.length < 2 * 1024 * 1024) { // max 2MB base64
-          mediaData = media.data;
-        }
-      }
-    } catch (e) { console.error('Erro download mídia:', e.message); }
-  }
-
-  const msgBody = msg.body || (mediaType ? `[${mediaType.split('/')[0]}]` : '');
-
-  await db.run(
-    'INSERT OR IGNORE INTO messages (id,chat_id,from_me,author,body,timestamp,media_type,media_filename,media_data,transcription,summary) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-    [msg.id._serialized, chat.id._serialized, msg.fromMe ? 1 : 0, msg.author || msg.from, msgBody, msg.timestamp, mediaType, mediaFilename, mediaData, transcription, summary]
-  );
-
-  io.emit('message', {
-    chatId: chat.id._serialized,
-    message: { id: msg.id._serialized, fromMe: msg.fromMe, author: msg.author || msg.from, body: msgBody, timestamp: msg.timestamp, mediaType, mediaFilename, transcription, summary },
-  });
-});
-
-// Remover lock files do Chromium (busca recursiva em todo .wwebjs_auth)
-function removeLockFiles(dir) {
-  try {
-    if (!fs.existsSync(dir)) return;
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        removeLockFiles(full);
-      } else if (entry.name.startsWith('Singleton') || entry.name === 'lockfile') {
-        try { fs.unlinkSync(full); console.log('Lock removido:', full); } catch(e) { console.log('Erro ao remover lock:', full, e.message); }
-      }
-    }
-  } catch(e) { console.log('Erro ao listar dir:', dir, e.message); }
-}
-removeLockFiles(path.join(__dirname, '.wwebjs_auth'));
-console.log('Limpeza de locks concluida');
-
-wppClient.initialize();
-
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 async function upsertChat(chat, lastMsg = null) {
   const body = lastMsg?.body || (lastMsg?.hasMedia ? '[mídia]' : null);
@@ -297,7 +219,7 @@ async function upsertChat(chat, lastMsg = null) {
        last_message=COALESCE(excluded.last_message,last_message),
        last_message_time=COALESCE(excluded.last_message_time,last_message_time),
        updated_at=${now}`,
-    [chat.id._serialized, chat.name, chat.isGroup ? 1 : 0, body, lastMsg?.timestamp || null]
+    [chat.id._serialized, chat.name, chat.isGroup ? boolVal(true) : boolVal(false), body, lastMsg?.timestamp || null]
   );
 }
 
@@ -326,7 +248,7 @@ app.get('/api/chats', async (req, res) => {
     const F = isPostgres ? 'false' : '0';
     if (archived === '1') sql += ` AND c.archived=${T}`;
     else sql += ` AND (c.archived=${F} OR c.archived IS NULL)`;
-    if (search) { sql += ' AND c.name ILIKE ?'; p.push(`%${search}%`); }
+    if (search) { sql += isPostgres ? ' AND c.name ILIKE ?' : ' AND c.name LIKE ?'; p.push(`%${search}%`); }
     if (unhandled === '1') sql += ` AND c.unhandled=${T}`;
     if (type === 'group') sql += ` AND c.is_group=${T}`;
     else if (type === 'direct') sql += ` AND c.is_group=${F}`;
@@ -351,13 +273,12 @@ app.get('/api/chats/:chatId/messages', async (req, res) => {
     const msgs = await chat.fetchMessages({ limit });
     for (const m of msgs) {
       await db.run('INSERT OR IGNORE INTO messages (id,chat_id,from_me,author,body,timestamp) VALUES (?,?,?,?,?,?)',
-        [m.id._serialized, chatId, m.fromMe ? 1 : 0, m.author || m.from, m.body, m.timestamp]);
+        [m.id._serialized, chatId, m.fromMe ? boolVal(true) : boolVal(false), m.author || m.from, m.body, m.timestamp]);
     }
-    res.json(msgs.map(m => ({ id: m.id._serialized, chat_id: chatId, from_me: m.fromMe?1:0, author: m.author||m.from, body: m.body, timestamp: m.timestamp })));
+    res.json(msgs.map(m => ({ id: m.id._serialized, chat_id: chatId, from_me: m.fromMe, author: m.author||m.from, body: m.body, timestamp: m.timestamp })));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Enviar mensagem de texto
 app.post('/api/chats/:chatId/send', async (req, res) => {
   if (!clientReady) return res.status(503).json({ error: 'WhatsApp não conectado' });
   const { chatId } = req.params;
@@ -366,14 +287,13 @@ app.post('/api/chats/:chatId/send', async (req, res) => {
   try {
     const sentMsg = await wppClient.sendMessage(chatId, message);
     const ts = Math.floor(Date.now() / 1000);
-    await db.run('INSERT OR IGNORE INTO messages (id,chat_id,from_me,body,timestamp) VALUES (?,?,1,?,?)',
-      [sentMsg.id._serialized, chatId, message, ts]);
+    await db.run('INSERT OR IGNORE INTO messages (id,chat_id,from_me,body,timestamp) VALUES (?,?,?,?,?)',
+      [sentMsg.id._serialized, chatId, boolVal(true), message, ts]);
     await db.run('UPDATE chats SET last_message=?, last_message_time=?, updated_at=? WHERE id=?', [message, ts, ts, chatId]);
     res.json({ ok: true, id: sentMsg.id._serialized });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Enviar arquivo/áudio
 app.post('/api/chats/:chatId/send-media', upload.single('file'), async (req, res) => {
   if (!clientReady) return res.status(503).json({ error: 'WhatsApp não conectado' });
   const { chatId } = req.params;
@@ -381,18 +301,16 @@ app.post('/api/chats/:chatId/send-media', upload.single('file'), async (req, res
   try {
     const base64 = req.file.buffer.toString('base64');
     const media = new MessageMedia(req.file.mimetype, base64, req.file.originalname);
-    const caption = req.body.caption || '';
-    const sentMsg = await wppClient.sendMessage(chatId, media, { caption });
+    const sentMsg = await wppClient.sendMessage(chatId, media, { caption: req.body.caption || '' });
     const ts = Math.floor(Date.now() / 1000);
-    const body = caption || `[${req.file.mimetype.split('/')[0]}]`;
-    await db.run('INSERT OR IGNORE INTO messages (id,chat_id,from_me,body,timestamp,media_type,media_filename) VALUES (?,?,1,?,?,?,?)',
-      [sentMsg.id._serialized, chatId, body, ts, req.file.mimetype, req.file.originalname]);
+    const body = req.body.caption || `[${req.file.mimetype.split('/')[0]}]`;
+    await db.run('INSERT OR IGNORE INTO messages (id,chat_id,from_me,body,timestamp,media_type,media_filename) VALUES (?,?,?,?,?,?,?)',
+      [sentMsg.id._serialized, chatId, boolVal(true), body, ts, req.file.mimetype, req.file.originalname]);
     await db.run('UPDATE chats SET last_message=?, last_message_time=?, updated_at=? WHERE id=?', [body, ts, ts, chatId]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Transcrever áudio recebido manualmente
 app.post('/api/messages/:msgId/transcribe', async (req, res) => {
   if (!openai) return res.status(503).json({ error: 'OpenAI não configurado' });
   const { msgId } = req.params;
@@ -422,21 +340,18 @@ app.post('/api/messages/:msgId/transcribe', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Toggle não tratado
 app.post('/api/chats/:chatId/unhandled', async (req, res) => {
   await db.run('UPDATE chats SET unhandled=? WHERE id=?', [boolVal(req.body.unhandled), req.params.chatId]);
   io.emit('chat_updated', { chatId: req.params.chatId });
   res.json({ ok: true });
 });
 
-// Toggle arquivar
 app.post('/api/chats/:chatId/archive', async (req, res) => {
   await db.run('UPDATE chats SET archived=? WHERE id=?', [boolVal(req.body.archived), req.params.chatId]);
   io.emit('chat_updated', { chatId: req.params.chatId });
   res.json({ ok: true });
 });
 
-// Labels
 app.get('/api/labels', async (req, res) => res.json(await db.all('SELECT * FROM labels ORDER BY name')));
 app.post('/api/labels', async (req, res) => {
   const { name, color } = req.body;
@@ -467,7 +382,99 @@ app.post('/api/sync', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── Inicializar WhatsApp após DB ─────────────────────────────────────────────
+function initWhatsApp() {
+  const authStrategy = isPostgres
+    ? new RemoteAuth({ store: new PostgresStore(), backupSyncIntervalMs: 300000, clientId: 'crm' })
+    : new LocalAuth({ dataPath: './.wwebjs_auth' });
+
+  wppClient = new Client({
+    authStrategy,
+    puppeteer: {
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--single-process','--no-zygote'],
+    },
+  });
+
+  wppClient.on('qr', async (qr) => {
+    console.log('QR gerado — escaneie no app');
+    try { lastQR = await qrcode.toDataURL(qr); io.emit('qr', lastQR); } catch (e) {}
+  });
+
+  wppClient.on('ready', () => {
+    console.log('WhatsApp conectado!');
+    clientReady = true; lastQR = null;
+    io.emit('ready');
+    syncChats();
+  });
+
+  wppClient.on('remote_session_saved', () => console.log('Sessão salva no PostgreSQL'));
+  wppClient.on('auth_failure', (msg) => { console.error('Auth failure:', msg); io.emit('auth_failure'); });
+  wppClient.on('disconnected', (reason) => {
+    console.log('WhatsApp desconectado:', reason);
+    clientReady = false; io.emit('disconnected');
+  });
+
+  wppClient.on('message', async (msg) => {
+    try {
+      const chat = await msg.getChat();
+      await upsertChat(chat, msg);
+
+      let mediaType = null, mediaFilename = null, mediaData = null, transcription = null, summary = null;
+
+      if (msg.hasMedia) {
+        try {
+          const media = await msg.downloadMedia();
+          mediaType = media.mimetype;
+          mediaFilename = media.filename || null;
+          if (media.mimetype.startsWith('audio/') || media.mimetype === 'application/ogg') {
+            if (openai) {
+              try {
+                const audioBuffer = Buffer.from(media.data, 'base64');
+                const ext = media.mimetype.includes('ogg') ? 'ogg' : 'mp3';
+                const { toFile } = require('openai');
+                const file = await toFile(audioBuffer, `audio.${ext}`, { type: media.mimetype });
+                const result = await openai.audio.transcriptions.create({ file, model: 'whisper-1', language: 'pt' });
+                transcription = result.text;
+                if (transcription && transcription.length > 50) {
+                  const sumResult = await openai.chat.completions.create({
+                    model: 'gpt-4o-mini',
+                    messages: [
+                      { role: 'system', content: 'Faça um resumo conciso (máximo 2 linhas) do áudio transcrito.' },
+                      { role: 'user', content: transcription },
+                    ],
+                    max_tokens: 100,
+                  });
+                  summary = sumResult.choices[0].message.content;
+                }
+              } catch (e) { console.error('Erro transcrição:', e.message); }
+            }
+          } else if (media.data && media.data.length < 2 * 1024 * 1024) {
+            mediaData = media.data;
+          }
+        } catch (e) { console.error('Erro mídia:', e.message); }
+      }
+
+      const msgBody = msg.body || (mediaType ? `[${mediaType.split('/')[0]}]` : '');
+      await db.run(
+        'INSERT OR IGNORE INTO messages (id,chat_id,from_me,author,body,timestamp,media_type,media_filename,media_data,transcription,summary) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        [msg.id._serialized, chat.id._serialized, boolVal(msg.fromMe), msg.author || msg.from, msgBody, msg.timestamp, mediaType, mediaFilename, mediaData, transcription, summary]
+      );
+
+      io.emit('message', {
+        chatId: chat.id._serialized,
+        message: { id: msg.id._serialized, fromMe: msg.fromMe, author: msg.author || msg.from, body: msgBody, timestamp: msg.timestamp, mediaType, mediaFilename, transcription, summary },
+      });
+    } catch(e) { console.error('Erro ao processar mensagem:', e.message); }
+  });
+
+  wppClient.initialize();
+  console.log('WhatsApp inicializando...');
+}
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 initDB().then(() => {
   server.listen(PORT, () => console.log(`\n🚀 WhatsApp CRM rodando em http://localhost:${PORT}\n`));
+  initWhatsApp();
 }).catch(err => { console.error('Erro banco:', err.message); process.exit(1); });
