@@ -251,6 +251,18 @@ wppClient.on('message', async (msg) => {
   });
 });
 
+// Remover lock files do Chromium deixados por deploys anteriores
+try {
+  const lockFiles = [
+    '.wwebjs_auth/session-default/SingletonLock',
+    '.wwebjs_auth/session-default/SingletonCookie',
+    '.wwebjs_auth/session-default/SingletonSocket',
+  ];
+  for (const f of lockFiles) {
+    if (fs.existsSync(f)) { fs.unlinkSync(f); console.log('Lock removido:', f); }
+  }
+} catch(e) { console.log('Aviso ao remover locks:', e.message); }
+
 wppClient.initialize();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
