@@ -1,0 +1,17 @@
+{
+  "name": "whatsapp-crm",
+  "version": "1.0.0",
+  "description": "CRM interno para WhatsApp com etiquetas e controle de mensagens",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-session": "^1.18.0",
+    "socket.io": "^4.7.2",
+    "whatsapp-web.js": "^1.23.0",
+    "pg": "^8.11.3",
+    "qrcode": "^1.5.3"
+  }
+}

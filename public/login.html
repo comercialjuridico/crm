@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WhatsApp CRM — Login</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0f1117;
+      color: #e8eaf0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      background: #1a1d27;
+      border: 1px solid #2e3347;
+      border-radius: 16px;
+      padding: 40px 36px;
+      width: 380px;
+      max-width: 95vw;
+    }
+    .logo {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .logo-icon {
+      font-size: 48px;
+      display: block;
+      margin-bottom: 8px;
+    }
+    .logo h1 {
+      font-size: 20px;
+      font-weight: 700;
+      color: #25d366;
+    }
+    .logo p {
+      font-size: 13px;
+      color: #8b91a8;
+      margin-top: 4px;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      color: #8b91a8;
+      margin-bottom: 6px;
+      margin-top: 18px;
+    }
+    input {
+      width: 100%;
+      padding: 11px 14px;
+      background: #0f1117;
+      border: 1px solid #2e3347;
+      border-radius: 10px;
+      color: #e8eaf0;
+      font-size: 15px;
+      transition: border-color .15s;
+    }
+    input:focus { outline: none; border-color: #25d366; }
+    .btn {
+      margin-top: 24px;
+      width: 100%;
+      padding: 12px;
+      background: #25d366;
+      color: #000;
+      border: none;
+      border-radius: 10px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: opacity .15s;
+    }
+    .btn:hover { opacity: .9; }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .error {
+      margin-top: 14px;
+      padding: 10px 14px;
+      background: rgba(239,68,68,.15);
+      border: 1px solid rgba(239,68,68,.4);
+      border-radius: 8px;
+      color: #f87171;
+      font-size: 13px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">
+      <span class="logo-icon">💬</span>
+      <h1>WhatsApp CRM</h1>
+      <p>Comercial Jurídico</p>
+    </div>
+
+    <form id="login-form">
+      <label for="email">Email</label>
+      <input id="email" type="email" placeholder="seu@email.com" autocomplete="email" required />
+
+      <label for="password">Senha</label>
+      <input id="password" type="password" placeholder="••••••••" autocomplete="current-password" required />
+
+      <button class="btn" type="submit" id="btn-login">Entrar</button>
+      <div class="error" id="error-msg"></div>
+    </form>
+  </div>
+
+  <script>
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('btn-login');
+      const errorEl = document.getElementById('error-msg');
+      btn.disabled = true;
+      btn.textContent = 'Entrando...';
+      errorEl.style.display = 'none';
+
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
+
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          window.location.href = '/';
+        } else {
+          errorEl.textContent = data.error || 'Erro ao entrar';
+          errorEl.style.display = 'block';
+          btn.disabled = false;
+          btn.textContent = 'Entrar';
+        }
+      } catch {
+        errorEl.textContent = 'Erro de conexão. Verifique se o servidor está rodando.';
+        errorEl.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = 'Entrar';
+      }
+    });
+  </script>
+</body>
+</html>
